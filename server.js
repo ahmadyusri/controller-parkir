@@ -2,14 +2,22 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const { Server } = require('socket.io');
+const url = require('url');
 
 const activeDevices = new Map();
 let eventLogs = [];
 const MAX_LOGS = 50;
 
-// 1. HTTP Server menyajikan file index.html eksternal
+// Daftar kartu RFID yang terdaftar
+const registeredCardIds = ["706547715", "2071513441", "975045768"];
+
 const httpServer = http.createServer((req, res) => {
-    if (req.url === '/' || req.url === '/index.html') {
+    const parsedUrl = url.parse(req.url, true);
+    const pathname = parsedUrl.pathname;
+    const query = parsedUrl.query;
+
+    // Web Dashboard Static File
+    if (pathname === '/' || pathname === '/index.html') {
         const filePath = path.join(__dirname, 'index.html');
         fs.readFile(filePath, (err, content) => {
             if (err) {
@@ -20,10 +28,65 @@ const httpServer = http.createServer((req, res) => {
             res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
             res.end(content);
         });
-    } else {
-        res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
-        res.end('Not Found');
+        return;
     }
+
+    // HTTP API Endpoints
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+
+    // 1. Endpoint /tiket (Tombol Start)
+    if (pathname === '/tiket' || pathname === '/tiket/') {
+        const deviceId = query.gate || 'UNKNOWN';
+        recordLog('HTTP', deviceId, 'HTTP_TIKET', query);
+
+        // Contoh logika: Tombol selalu diberikan akses (true)
+        res.writeHead(200);
+        res.end(JSON.stringify({ access: true, message: "Tiket diproses" }));
+        return;
+    }
+
+    // Endpoint /member (Cek RFID / Card)
+    if (pathname === '/member' || pathname === '/member/') {
+        const deviceId = query.gate || 'UNKNOWN';
+        const cardId = query.text || query.card_id || '';
+        recordLog('HTTP', deviceId, 'HTTP_MEMBER', query);
+
+        // Validasi kartu RFID
+        const hasAccess = registeredCardIds.includes(cardId);
+
+        res.writeHead(200);
+        res.end(JSON.stringify({ access: hasAccess }));
+        return;
+    }
+
+    // Endpoint /bantuan (Help)
+    if (pathname === '/bantuan' || pathname === '/bantuan/') {
+        const deviceId = query.gate || 'UNKNOWN';
+        recordLog('HTTP', deviceId, 'HTTP_BANTUAN', query);
+
+        res.writeHead(200);
+        res.end(JSON.stringify({ access: true, message: "Bantuan dicatat" }));
+        return;
+    }
+
+    // Endpoint /capture
+    if (pathname === '/capture' || pathname === '/capture/') {
+        const deviceId = query.gate || 'UNKNOWN';
+        recordLog('HTTP', deviceId, 'HTTP_CAPTURE', query);
+
+        // Cek sensor vld1 atau vld2
+        const vld1 = query.vld1_kios === 'true';
+        const vld2 = query.vld2_kios === 'true';
+        const allow = vld1 || vld2;
+
+        res.writeHead(200);
+        res.end(JSON.stringify({ access: allow, process: allow ? "allowProcess" : "disallowProcess" }));
+        return;
+    }
+
+    // Jika rute tidak ditemukan
+    res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('Not Found');
 });
 
 const io = new Server(httpServer, {
@@ -39,7 +102,7 @@ function recordLog(socketId, deviceId, eventName, eventData) {
         data: eventData || {}
     };
 
-    console.log(`${logEntry.time} - [${eventName}] Device: ${logEntry.deviceId} | SocketID: ${socketId}`, eventData || '');
+    console.log(`${logEntry.time} - [${eventName}] Device: ${logEntry.deviceId} | Source: ${socketId}`, eventData || '');
 
     eventLogs.unshift(logEntry);
     if (eventLogs.length > MAX_LOGS) eventLogs.pop();
@@ -65,7 +128,7 @@ function broadcastDashboardData() {
     });
 }
 
-// 2. Middleware Auth: Hanya validasi token jika request dari Device (ESP)
+// Middleware Auth Socket.IO
 io.use((socket, next) => {
     const token = socket.handshake.headers.authorization;
 
@@ -89,7 +152,6 @@ io.on('connection', (socket) => {
     if (socket.isWebDashboard) {
         console.log(new Date().toLocaleString() + ' - Web Dashboard terhubung. SocketID:', socket.id);
 
-        // Kirim initial state ke dashboard baru
         socket.emit('update_monitoring', {
             devices: Array.from(activeDevices.entries()).map(([k, v]) => ({
                 socketId: k,
@@ -110,7 +172,6 @@ io.on('connection', (socket) => {
             recordLog(targetSocketId, activeDevices.get(targetSocketId)?.deviceId || 'UNKNOWN', 'ADMIN_CMD', commandPayload);
         });
 
-        // Event handler untuk clear logs dari dashboard
         socket.on('clear_logs', () => {
             eventLogs = [];
             console.log(new Date().toLocaleString() + ' - Event logs dibersihkan oleh admin.');
@@ -120,7 +181,7 @@ io.on('connection', (socket) => {
         return;
     }
 
-    // Logika Khusus Device (ESP)
+    // Fallback Socket.IO handler
     const connectTime = new Date();
     activeDevices.set(socket.id, {
         timestamp: Date.now(),
@@ -130,7 +191,7 @@ io.on('connection', (socket) => {
     });
     checkAndUpdateDeviceId({ id: deviceId });
 
-    recordLog(socket.id, deviceId, 'CONNECT', { message: 'Device terhubung' });
+    recordLog(socket.id, deviceId, 'CONNECT', { message: 'Device terhubung via Socket' });
 
     const testingInterval = setInterval(() => {
         socket.emit('command', { "action": "playAudio", "folder": "02", "track": "02" });
@@ -146,10 +207,8 @@ io.on('connection', (socket) => {
         const devId = devInfo ? devInfo.deviceId : deviceId;
 
         if (devInfo && devInfo.deviceId) {
-            // Jika device sudah memiliki ID, ubah status menjadi offline
             devInfo.isOnline = false;
         } else {
-            // Jika belum punya ID (masih "Menunggu ID..."), hapus dari Map
             activeDevices.delete(socket.id);
         }
 
@@ -160,16 +219,12 @@ io.on('connection', (socket) => {
     function checkAndUpdateDeviceId(data) {
         if (data && data.id) {
             const newDeviceId = data.id;
-
-            // Cek apakah ada device lain (baik online/offline) yang menggunakan deviceId yang sama
             for (const [existingSocketId, devData] of activeDevices.entries()) {
                 if (existingSocketId !== socket.id && devData.deviceId === newDeviceId) {
-                    // Hapus data lama yang memiliki deviceId kembar/sama
                     activeDevices.delete(existingSocketId);
                 }
             }
 
-            // Update deviceId untuk koneksi socket yang sedang aktif ini
             const dev = activeDevices.get(socket.id);
             if (dev) {
                 dev.deviceId = newDeviceId;
@@ -203,8 +258,6 @@ io.on('connection', (socket) => {
                 socket.emit('command', { "action": "openGate" });
             }, 2000);
         } else {
-            const registeredCardIds = ["706547715", "2071513441"];
-
             if (registeredCardIds.includes(data.card_id)) {
                 setTimeout(() => {
                     socket.emit('command', { "action": "openGate" });
@@ -233,5 +286,5 @@ io.on('connection', (socket) => {
 });
 
 httpServer.listen(9010, () => {
-    console.log(new Date().toLocaleString() + ' - Server Testing & Monitoring berjalan di port 9010');
+    console.log(new Date().toLocaleString() + ' - Server HTTP & Monitoring berjalan di port 9010');
 });
